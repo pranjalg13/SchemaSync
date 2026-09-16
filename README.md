@@ -120,6 +120,18 @@ rather than a drop plus an add, that `main` stays untouched until the merge, tha
 lands on `main` with the renamed column's data intact, and that DDL run outside SchemaSync is caught
 as drift.
 
+### UI smoke test
+
+```bash
+cd web && npm run test:ui
+```
+
+Drives the real app in a real browser against the real API. Narrow on purpose: it checks the one
+thing the UI is responsible for getting right — that editing a column's name and type in one dialog
+reaches Postgres as a **single commit containing both operations**, that the diff still calls it a
+rename, and that dropping a column refuses a bare click. It uses your installed Chrome
+(`channel: 'chrome'`), so there is no browser download.
+
 ### Seeing the zero-downtime claim hold up
 
 ```bash

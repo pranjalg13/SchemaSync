@@ -384,6 +384,36 @@ Reusing the name afterwards then needs the uniqueness constraint to ignore tombs
 
 ---
 
+## 18. One dialog per object, not one prompt per attribute
+
+**Chose:** a single form that edits every attribute of a column at once and emits only what
+changed.
+
+**Replaced:** a chain of browser `prompt()` calls — one for the name, one for the type, one for
+nullability, one for the default.
+
+**Reasoning:** this looked like a cosmetic change and was not. `prompt()` can only ask one question,
+so renaming *and* retyping a column meant two dialogs and — the part that actually mattered — **two
+separate commits**, describing a change nobody made in two steps. The operation log is meant to be
+the honest record of what happened; a UI constraint was corrupting it. One form produces one commit
+with both operations, which is also exactly the shape the merge planner is built to compile.
+
+The same reasoning drives the rest of the UI decisions:
+
+- **Destructive actions require typing the object's name**, not an OK button. These are the actions
+  that delete a column of production data on merge, and a reflexive click is how that happens.
+- **Row actions are dimmed rather than hidden.** Fully hiding them until hover looks calmer but is
+  undiscoverable — a user has no reason to hover a row they do not already know is interactive.
+- **A `NOT NULL` column with no default is blocked in the form** when the table has rows, with the
+  reason shown, instead of being submitted and rejected by Postgres.
+- **The type field is a free-text input with suggestions**, not a dropdown. The type space is open
+  (domains, extension types), and someone who knows they want `numeric(14,2)` should just type it.
+
+**Cut:** inline editing directly in the table row. It reads well in a mockup but makes the
+multi-attribute case worse, which is the case that matters here.
+
+---
+
 ## Deliberately cut, with reasons
 
 | Cut | Why |
