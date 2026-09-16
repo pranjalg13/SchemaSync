@@ -35,7 +35,7 @@ schemasync:
     # Tripwire: if an operation classified metadata-only actually rewrites, it dies
     # here instead of holding ACCESS EXCLUSIVE over a full table rewrite.
     ddl-statement-timeout: 15s
-    validate-statement-timeout: 30min
+    validate-statement-timeout: 30m
     batch-statement-timeout: 30s
     max-lock-retries: 25
     max-backoff: 60s

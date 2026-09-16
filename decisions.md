@@ -259,6 +259,54 @@ again rather than left in the pom as cargo cult.
 
 ---
 
+## 13. The snapshot is read back from the database, not predicted
+
+**Chose:** after applying operations to a branch, re-introspect the schema and store *that* as the
+new snapshot — passing the in-memory mutated snapshot in only as the source of stable IDs.
+
+**Considered:** trusting the in-memory mutation, which is what I built first. It is faster (no
+extra round trip) and obviously correct in the common case.
+
+**Reasoning:** it is not correct in the uncommon case, and I only found this by running the thing
+end to end. Postgres does **not** rewrite a column's `DEFAULT` when you retype the column. After
+`ALTER COLUMN status TYPE text`, the default is still stored as `'pending'::character varying`.
+My model predicted `'pending'`; the database said otherwise. Drift detection — which exists
+precisely to catch the recorded snapshot disagreeing with reality — then fired on SchemaSync's
+*own* changes, marking a healthy branch `DRIFTED`.
+
+That is the general shape of the problem: any model that predicts what Postgres will do will
+eventually mispredict, and each mispredict poisons the snapshot for every later diff and merge.
+Reading back is one extra query against a schema we already know is small.
+
+The subtlety that makes it work: introspection alone cannot know a rename happened, so reading
+back naively would mint fresh IDs and destroy the identity the rename depended on. Passing the
+mutated snapshot as the ID source fixes that — its names are already post-rename, so IDs carry
+across by name. The result has **the database's content with the operation log's identity**, which
+is the combination we actually want.
+
+**A second, smaller fix from the same finding:** the stale `::character varying` cast left on a
+retyped column is harmless to Postgres but cannot be canonicalised away (the cast no longer matches
+the column type), so it showed up as a spurious `COLUMN_DEFAULT_CHANGED` in every subsequent diff.
+Re-stating the default immediately after a retype lets Postgres re-cast it and keeps the diff
+honest.
+
+---
+
+## 14. Editing `main` directly is refused
+
+**Chose:** operations against the `main` branch are rejected outright. Changes reach `main` only
+through a merge.
+
+**Reasoning:** `main` is the branch backed by the real, full-size schema. It is the one place where
+an `ALTER TABLE` is genuinely dangerous, and it is also the only path that gets the safety
+classification, the pre-flight validation and the online execution strategy. Allowing a direct edit
+would mean a second, unaudited route to production that bypasses every protection the product
+exists to provide. Refusing is one line and removes the whole category.
+
+`deleteBranch` refuses `main` for the same reason: its Postgres schema *is* the project's data.
+
+---
+
 ## Deliberately cut, with reasons
 
 | Cut | Why |

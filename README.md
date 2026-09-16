@@ -65,6 +65,20 @@ mvn verify                 # unit + integration (Testcontainers spins up Postgre
 mvn verify -Pscale         # adds the slow concurrent-workload test
 ```
 
+There is also an end-to-end walkthrough that drives the real HTTP API against a real database and
+asserts on what actually landed in Postgres:
+
+```bash
+docker compose up -d db && ./scripts/seed.sh 100000
+cd backend && mvn spring-boot:run     # in another shell
+./scripts/e2e.sh
+```
+
+It checks the things that would matter if they broke: that branching a 100k-row table stays under a
+second, that sampled child rows never reference a missing parent, that a rename reaches Postgres as
+`ALTER ... RENAME` and shows in the diff as a rename rather than a drop plus an add, that `main` is
+untouched throughout, and that DDL run outside SchemaSync is caught as drift.
+
 The tests worth looking at first:
 
 | Test | What it actually catches |
