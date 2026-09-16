@@ -86,7 +86,8 @@ public class MergeService {
 
         List<String> blockers = preflight(target.pgSchemaName(), ours, merged, rowCounts);
 
-        return new Prepared(source, target, baseCommitId, merged, result.conflicts(), plan, blockers);
+        return new Prepared(source, target, baseCommitId, merged, result.conflicts(), plan,
+                blockers, resolutions == null ? Map.of() : resolutions);
     }
 
     /**
@@ -184,9 +185,14 @@ public class MergeService {
                             "SELECT count(*) FROM " + qualified + " WHERE " + column + " IS NULL",
                             Long.class);
                     if (nulls != null && nulls > 0 && mergedColumn.defaultExpr() == null) {
+                        // Say what to do, not just what is wrong. The fill value supplied when the
+                        // branch was edited is an operation parameter, not schema state, so it is
+                        // not carried in the snapshot -- and the branch's sampled rows were filled
+                        // long before anyone saw main's real NULL count.
                         blockers.add(String.format(
-                                "%s.%s cannot become NOT NULL: %,d row%s are NULL and there is no "
-                                + "default to fill them with.",
+                                "%s.%s cannot become NOT NULL: %,d row%s in the target are NULL. "
+                                + "Set a default on the column in your branch and merge again -- "
+                                + "the migration will use it to fill those rows in batches.",
                                 targetTable.name(), targetColumn.name(), nulls, nulls == 1 ? "" : "s"));
                     }
                 }
@@ -238,10 +244,27 @@ public class MergeService {
             SchemaSnapshot merged,
             List<MergeConflict> conflicts,
             MigrationPlan plan,
-            List<String> blockers) {
+            List<String> blockers,
+            Map<String, String> resolutions) {
 
+        /** True once the user has answered this conflict, either way. */
+        public boolean isAnswered(MergeConflict c) {
+            return resolutions.containsKey(c.stableId() + ":" + c.attribute())
+                    || resolutions.containsKey(c.stableId());
+        }
+
+        /**
+         * Conflicts still awaiting a decision.
+         *
+         * <p>Answered ones stay in {@link #conflicts()} so the UI can keep showing them with the
+         * choice highlighted -- hiding a conflict the moment it is answered would make it
+         * impossible to review or change your mind before applying.
+         */
         public List<MergeConflict> unresolved() {
-            return conflicts.stream().filter(c -> !c.isAutoResolved()).toList();
+            return conflicts.stream()
+                    .filter(c -> !c.isAutoResolved())
+                    .filter(c -> !isAnswered(c))
+                    .toList();
         }
 
         public boolean canApply() {

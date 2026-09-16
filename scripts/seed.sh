@@ -21,13 +21,11 @@ export PGPASSWORD="${PGPASSWORD:-schemasync}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 psql_run() { psql -v ON_ERROR_STOP=1 -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" "$@"; }
 
-echo "==> Creating demo schema"
+echo "==> Creating demo schema (drops and recreates schema \"main\")"
 psql_run -q -f "$SCRIPT_DIR/demo-schema.sql"
 
 echo "==> Seeding ${CUSTOMERS} customers, ${PRODUCTS} products, ${ORDERS} orders"
 psql_run -q <<SQL
-TRUNCATE main.order_items, main.orders, main.products, main.customers RESTART IDENTITY CASCADE;
-
 INSERT INTO main.customers (email, full_name)
 SELECT 'customer' || i || '@example.com', 'Customer ' || i
 FROM generate_series(1, ${CUSTOMERS}) AS i;

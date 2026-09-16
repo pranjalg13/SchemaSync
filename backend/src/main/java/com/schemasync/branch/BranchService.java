@@ -224,8 +224,24 @@ public class BranchService {
                     "refusing to delete 'main': it is backed by the project's own schema");
         }
         jdbc.execute("DROP SCHEMA IF EXISTS " + DdlSql.quote(branch.pgSchemaName()) + " CASCADE");
-        store.deleteBranch(branchId);
-        log.info("Deleted branch '{}' and schema '{}'", branch.name(), branch.pgSchemaName());
+
+        // History is not the branch's to delete. Once merged, its head commit is the second parent
+        // of a merge commit on the target, so removing it would tear a hole in the shared graph --
+        // Postgres rejects it outright, and it would be wrong even if it did not. Dropping the
+        // schema reclaims what actually costs anything; the commits stay.
+        boolean hasHistory = jdbc.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM sv.schema_commit WHERE branch_id = ?)",
+                Boolean.class, branchId);
+
+        if (Boolean.TRUE.equals(hasHistory)) {
+            jdbc.update("UPDATE sv.branch SET status = 'ABANDONED', schema_dropped = true WHERE id = ?",
+                    branchId);
+            log.info("Dropped schema '{}' for branch '{}'; its commits are kept as shared history",
+                    branch.pgSchemaName(), branch.name());
+        } else {
+            store.deleteBranch(branchId);
+            log.info("Deleted branch '{}' and schema '{}'", branch.name(), branch.pgSchemaName());
+        }
     }
 
     /**

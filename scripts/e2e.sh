@@ -20,6 +20,25 @@ FAILURES=0
 
 jqp() { python3 -c "import sys,json;$1" ; }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# A test that depends on leftover state is a test that passes once. Reset to a known schema and
+# a clean control plane every run, so this is repeatable and a reviewer gets the same output.
+if [ "${E2E_SKIP_RESET:-0}" != "1" ]; then
+  step "0. Reset to a known state"
+  "${PSQL[@]}" -c "SELECT 'DROP SCHEMA IF EXISTS ' || quote_ident(nspname) || ' CASCADE;'
+                   FROM pg_namespace WHERE nspname LIKE 'br\\_%';" \
+    | psql -h "${PGHOST:-localhost}" -U "${PGUSER:-schemasync}" -d "${PGDATABASE:-schemasync}" \
+           -q -v ON_ERROR_STOP=1 2>/dev/null
+  "${PSQL[@]}" -c "TRUNCATE sv.project CASCADE;" >/dev/null 2>&1
+  "$SCRIPT_DIR/seed.sh" "${E2E_ROWS:-100000}" >/dev/null 2>&1
+  echo "        reseeded main with ${E2E_ROWS:-100000} orders; control plane cleared"
+  echo "        restarting the API so it re-imports the demo project..."
+  # The demo project is imported at startup, so the API has to see the fresh schema.
+  curl -fsS -X POST "$API/admin/reimport" >/dev/null 2>&1 || true
+  sleep 1
+fi
+
 step "1. Project imported from the live schema"
 PROJECT=$(curl -fsS "$API/projects")
 PID=$(echo "$PROJECT" | jqp "print(json.load(sys.stdin)[0]['id'])")
@@ -134,6 +153,70 @@ import sys;print([b['id'] for b in json.load(sys.stdin) if b['name']=='main'][0]
 ERR2=$(curl -sS -X POST "$API/branches/$MAIN_BID/operations" -H 'Content-Type: application/json' \
   -d "{\"operations\":[{\"op\":\"DROP_TABLE\",\"tableId\":\"$ORDERS\"}]}")
 case "$ERR2" in *"cannot be edited directly"*) pass "main rejects direct edits";; *) fail "main was editable: $ERR2";; esac
+
+step "9. Merge back into main, applied to the real database"
+PREVIEW=$(curl -fsS -X POST "$API/branches/$BID/merge/preview" -H 'Content-Type: application/json' -d '{}')
+echo "$PREVIEW" | python3 -c "
+import sys,json
+p=json.load(sys.stdin)
+print(f\"        {p['source']} -> {p['target']}  mode={p['mode']}  canApply={p['canApply']}\")
+for s in p['steps']:
+    print(f\"        {s['seq']}. [{s['verdict']:7}] blocks={s['blocks']:17} {s['description'][:60]}\")"
+
+MODE=$(echo "$PREVIEW" | jqp "print(json.load(sys.stdin)['mode'])")
+CAN=$(echo "$PREVIEW" | jqp "print(json.load(sys.stdin)['canApply'])")
+[ "$CAN" = "True" ] && pass "merge is applicable with no outstanding conflicts" || fail "cannot apply: $PREVIEW"
+
+# The rename must appear in the plan as a RENAME and never as a DROP. This is the assertion the
+# whole identity model exists to satisfy: as a drop plus an add it would destroy a column of data.
+RENAME_STEPS=$(echo "$PREVIEW" | jqp "
+import sys;p=json.load(sys.stdin)
+print(sum(1 for s in p['steps'] if s['sql'] and 'RENAME COLUMN' in s['sql']))")
+DROP_STEPS=$(echo "$PREVIEW" | jqp "
+import sys;p=json.load(sys.stdin)
+print(sum(1 for s in p['steps'] if s['sql'] and 'DROP COLUMN' in s['sql']))")
+[ "$RENAME_STEPS" = "1" ] && pass "plan renames the column" || fail "expected 1 RENAME, got $RENAME_STEPS"
+[ "$DROP_STEPS" = "1" ] && pass "plan has exactly 1 DROP (the column actually dropped), not 2" \
+                        || fail "expected 1 DROP COLUMN, got $DROP_STEPS"
+
+MAIN_BEFORE=$("${PSQL[@]}" -c "SELECT string_agg(column_name,',' ORDER BY ordinal_position)
+  FROM information_schema.columns WHERE table_schema='main' AND table_name='orders';")
+
+RUNID=$(curl -fsS -X POST "$API/branches/$BID/merge/apply" -H 'Content-Type: application/json' \
+  -d '{"author":"e2e"}' | jqp "print(json.load(sys.stdin)['runId'])")
+for _ in $(seq 1 180); do
+  RSTATUS=$(curl -fsS "$API/runs/$RUNID" | jqp "print(json.load(sys.stdin)['status'])")
+  case "$RSTATUS" in SUCCEEDED|FAILED) break;; esac
+  sleep 1
+done
+[ "$RSTATUS" = "SUCCEEDED" ] && pass "migration applied to main" || {
+  fail "migration $RSTATUS"
+  curl -fsS "$API/runs/$RUNID" | python3 -c "
+import sys,json
+r=json.load(sys.stdin)
+print('        ', r.get('error_message'))
+for s in r['steps']:
+    if s.get('error'): print('        step', s['seq'], s['error'][:200])"
+}
+
+step "10. main really changed, and the data survived the rename"
+MAIN_AFTER=$("${PSQL[@]}" -c "SELECT string_agg(column_name,',' ORDER BY ordinal_position)
+  FROM information_schema.columns WHERE table_schema='main' AND table_name='orders';")
+echo "        before: $MAIN_BEFORE"
+echo "        after : $MAIN_AFTER"
+case "$MAIN_AFTER" in *amount_cents*) pass "main now has amount_cents";; *) fail "rename did not reach main";; esac
+case "$MAIN_AFTER" in *currency*) pass "main now has currency";; *) fail "new column missing from main";; esac
+
+# The point of tracking identity: the renamed column still holds its values.
+NONZERO=$("${PSQL[@]}" -c "SELECT count(*) FROM main.orders WHERE amount_cents IS NOT NULL;")
+[ "$NONZERO" -gt 0 ] && pass "$NONZERO rows still have their amount after the rename" \
+                     || fail "renamed column is empty -- data was lost"
+
+# Every statement that actually ran is recorded, and none of them dropped the renamed column.
+BADDROP=$("${PSQL[@]}" -c "SELECT count(*) FROM sv.migration_step
+  WHERE run_id='$RUNID' AND sql_text ILIKE '%DROP COLUMN \"amount\"%';")
+[ "$BADDROP" = "0" ] && pass "no executed statement dropped the renamed column" \
+                     || fail "the rename was executed as a drop"
 
 step "Cleanup"
 curl -fsS -X DELETE "$API/branches/$BID" -o /dev/null -w '' || true

@@ -364,6 +364,26 @@ the identity model exists to prevent. The escape hatch restores usability, not h
 
 ---
 
+## 17. Deleting a branch drops its storage, not its history
+
+**Chose:** deleting a branch drops its Postgres schema and leaves an `ABANDONED` tombstone row;
+its commits stay.
+
+**Found by:** the end-to-end script failing on cleanup. Deleting a merged branch cascaded to its
+commits, and Postgres rejected it — the merge commit on `main` references that branch's head as its
+**second parent**. The foreign key was right and my mental model was wrong.
+
+**Reasoning:** once a branch is merged, its history is no longer its own. It is part of the target's
+history, and the commit graph is what every future merge-base computation walks. Deleting it would
+either corrupt the DAG or require rewriting main's commits — and rewriting shared history to tidy up
+a branch is exactly the thing version control must not do. What deleting a branch is actually *for*
+is reclaiming the storage its schema occupies, and that still happens.
+
+Reusing the name afterwards then needs the uniqueness constraint to ignore tombstones, so
+`unique (project_id, name)` became a partial unique index `WHERE status <> 'ABANDONED'`.
+
+---
+
 ## Deliberately cut, with reasons
 
 | Cut | Why |

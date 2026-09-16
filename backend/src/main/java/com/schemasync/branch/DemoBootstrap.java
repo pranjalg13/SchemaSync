@@ -36,8 +36,19 @@ public class DemoBootstrap implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
+        importIfMissing();
+    }
+
+    /**
+     * Imports the demo project if it is not already there.
+     *
+     * <p>Exposed separately from startup so the end-to-end script can reset the database and have
+     * the API pick up the fresh schema without a restart -- a test that needs the server bounced
+     * between runs is a test nobody runs.
+     */
+    public boolean importIfMissing() {
         if (store.findProjectByName(DEMO_PROJECT).isPresent()) {
-            return;
+            return false;
         }
         Integer hasSchema = jdbc.queryForObject(
                 "SELECT count(*)::int FROM pg_namespace WHERE nspname = ?",
@@ -45,7 +56,7 @@ public class DemoBootstrap implements ApplicationRunner {
         if (hasSchema == null || hasSchema == 0) {
             log.info("Schema '{}' not found; skipping demo import. Run ./scripts/seed.sh to create it.",
                     props.mainSchema());
-            return;
+            return false;
         }
         Integer tables = jdbc.queryForObject("""
                 SELECT count(*)::int FROM pg_class c
@@ -54,10 +65,11 @@ public class DemoBootstrap implements ApplicationRunner {
                 """, Integer.class, props.mainSchema());
         if (tables == null || tables == 0) {
             log.info("Schema '{}' has no tables; skipping demo import.", props.mainSchema());
-            return;
+            return false;
         }
 
         branches.importProject(DEMO_PROJECT, props.mainSchema());
         log.info("Imported demo project '{}' from schema '{}'", DEMO_PROJECT, props.mainSchema());
+        return true;
     }
 }

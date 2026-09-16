@@ -29,16 +29,31 @@ public class SchemaSyncController {
     private final SchemaIntrospector introspector;
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
+    private final com.schemasync.branch.DemoBootstrap demoBootstrap;
 
     public SchemaSyncController(ControlPlaneStore store, BranchService branches,
                                 OperationService operations, SchemaIntrospector introspector,
-                                JdbcTemplate jdbc, ObjectMapper mapper) {
+                                JdbcTemplate jdbc, ObjectMapper mapper,
+                                com.schemasync.branch.DemoBootstrap demoBootstrap) {
         this.store = store;
         this.branches = branches;
         this.operations = operations;
         this.introspector = introspector;
         this.jdbc = jdbc;
         this.mapper = mapper;
+        this.demoBootstrap = demoBootstrap;
+    }
+
+    /**
+     * Re-imports the demo project if it is missing.
+     *
+     * <p>Only for local development and the end-to-end script, which resets the database between
+     * runs. It is a no-op when a project already exists, so it cannot clobber anything.
+     */
+    @PostMapping("/admin/reimport")
+    public Map<String, Object> reimport() {
+        boolean imported = demoBootstrap.importIfMissing();
+        return Map.of("imported", imported);
     }
 
     @GetMapping("/projects")

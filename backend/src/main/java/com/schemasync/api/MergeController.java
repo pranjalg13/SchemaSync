@@ -182,7 +182,8 @@ public class MergeController {
         List<ConflictView> conflicts = p.conflicts().stream()
                 .map(c -> new ConflictView(c.type().name(), c.severity().name(), c.objectKind(),
                         c.stableId(), c.tableName(), c.objectName(), c.attribute(),
-                        c.base(), c.ours(), c.theirs(), c.question(), c.isAutoResolved()))
+                        c.base(), c.ours(), c.theirs(), c.question(), c.isAutoResolved(),
+                        p.isAnswered(c)))
                 .toList();
 
         List<StepView> steps = p.plan().steps().stream()
@@ -205,7 +206,7 @@ public class MergeController {
     public record ConflictView(String type, String severity, String objectKind, String stableId,
                                String table, String object, String attribute,
                                String base, String ours, String theirs, String question,
-                               boolean autoResolved) {}
+                               boolean autoResolved, boolean answered) {}
 
     public record StepView(int seq, String group, String kind, String description, String sql,
                            String verdict, String blocks, String lockMode, String rationale,

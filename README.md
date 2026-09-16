@@ -44,6 +44,28 @@ through a client connection.
 
 ---
 
+## What it looks like
+
+The merge screen is where the product's point lands: every step carries what it costs and what it
+blocks, in plain English, *before* anything runs.
+
+```
+shipping_fields → main            online — staged, not atomic
+
+Plan — 4 step(s)
+ 1  Rename orders.status to order_status (instant, no data is touched)
+    [instant] [blocks reads + writes]
+    Renames the column in the catalog. No data is read or written -- this is why a
+    rename must never be applied as a drop plus an add.
+ 2  Add column orders.shipped_at timestamptz (instant)
+    [instant] [blocks reads + writes]
+    Adds a nullable column. Catalog change only, no rows are touched.
+ 4  Build index orders_shipped_idx without blocking writes (two passes over 1.9M rows)
+    [reads every row] [blocks nothing]
+    CONCURRENTLY makes two passes and waits for open transactions, so it takes longer
+    but never blocks reads or writes.
+```
+
 ## What it does
 
 - **Branch** a schema. A branch is a real Postgres schema (namespace) containing the same tables,
@@ -74,10 +96,34 @@ cd backend && mvn spring-boot:run     # in another shell
 ./scripts/e2e.sh
 ```
 
-It checks the things that would matter if they broke: that branching a 100k-row table stays under a
-second, that sampled child rows never reference a missing parent, that a rename reaches Postgres as
-`ALTER ... RENAME` and shows in the diff as a rename rather than a drop plus an add, that `main` is
-untouched throughout, and that DDL run outside SchemaSync is caught as drift.
+It resets to a known state first, then checks the things that would matter if they broke: that
+branching a 100k-row table stays under a second, that sampled child rows never reference a missing
+parent, that a rename reaches Postgres as `ALTER ... RENAME` and shows in the diff as a rename
+rather than a drop plus an add, that `main` stays untouched until the merge, that the merge actually
+lands on `main` with the renamed column's data intact, and that DDL run outside SchemaSync is caught
+as drift.
+
+### Seeing the zero-downtime claim hold up
+
+```bash
+pip3 install psycopg2-binary requests
+./scripts/zero_downtime_demo.py            # branch, retype, merge -- the online path
+./scripts/zero_downtime_demo.py --naive    # the same change as one ALTER TABLE
+```
+
+Both run a continuous read/write workload against `main.orders` while the migration happens
+underneath. Measured on 2,000,000 rows (354MB):
+
+| | Naive `ALTER TABLE` | SchemaSync online |
+| --- | --- | --- |
+| Wall clock | **4.9s** | 75.3s |
+| Requests served | 2,525 | 27,838 |
+| Failed requests | 0 | 0 |
+| **Worst single request** | **4,894 ms** | **1,112 ms** |
+
+Note that the naive run also reports zero errors. That is the trap: nothing failed, it just made
+every request during those five seconds hang. The online path is 15× slower in wall clock and that
+is the trade being made — bounded impact during business hours, not speed.
 
 The tests worth looking at first:
 
@@ -87,7 +133,8 @@ The tests worth looking at first:
 | `RenameIntegrityTest` | A rename-then-merge emits `ALTER ... RENAME` and **zero** `DROP COLUMN`, asserted against the executed statements. This guards the core claim. |
 | `MergeAlgebraTest` | `merge(base, x, x) == x`, `merge(base, x, base) == x`, and symmetry. Catches asymmetry bugs immediately. |
 | `RoundTripPropertyTest` | Materialise A, apply `diff(A, B)`, re-introspect — the canonical hash must equal B's. One property covering differ, planner, orderer and SQL renderer. |
-| `BackfillResumeTest` | Kill the runner mid-backfill; it resumes from its cursor rather than restarting. |
+| `VolatilityContractTest` | Proves the classification against Postgres by comparing `relfilenode` before and after: `DEFAULT now()` must not rewrite the table, `DEFAULT gen_random_uuid()` must. |
+| `MigrationPlannerTest` | The same retype produces 1 step on a small table and a 9-step online plan on a large one, with the sync trigger before the backfill and the swap after it. |
 
 ---
 
