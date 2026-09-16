@@ -255,6 +255,43 @@ public class BranchService {
         return drifted;
     }
 
+    /**
+     * Re-records a branch's live schema as its new head, clearing drift.
+     *
+     * <p>This is the "re-import" the DRIFTED error tells users to perform. Without it, a branch
+     * touched by out-of-band DDL would be permanently unusable, which turns a safety mechanism
+     * into a trap -- and the most likely person to hit it is someone who fixed something by hand
+     * in an incident.
+     *
+     * <p>What is lost is identity for anything that changed outside SchemaSync: introspection has
+     * no intent to work from, so a column renamed by hand is re-imported as a new column with a
+     * new stable id. That is stated rather than hidden, because it means a rename performed
+     * outside the tool will merge as a drop plus an add -- which is precisely the outcome the
+     * whole identity model exists to avoid.
+     */
+    @Transactional
+    public Records.Commit refresh(UUID branchId, String author) {
+        Records.Branch branch = store.findBranch(branchId)
+                .orElseThrow(() -> new IllegalArgumentException("no such branch"));
+
+        SchemaSnapshot previous = store.headSnapshot(branch);
+        SchemaSnapshot live = introspector.introspect(branch.pgSchemaName(), previous);
+
+        if (SnapshotHasher.hash(live).equals(SnapshotHasher.hash(previous))) {
+            store.setBranchStatus(branchId, "ACTIVE");
+            return store.findCommit(branch.headCommitId()).orElseThrow();
+        }
+
+        UUID snapshotId = store.saveSnapshot(live);
+        Records.Commit commit = store.commit(branch.projectId(), branchId, branch.headCommitId(),
+                null, snapshotId, "Re-import " + branch.pgSchemaName()
+                        + " after changes made outside SchemaSync", author);
+        store.setBranchStatus(branchId, "ACTIVE");
+
+        log.info("Refreshed branch '{}' from its live schema", branch.name());
+        return commit;
+    }
+
     private void requireSchemaExists(String schema) {
         Integer found = jdbc.queryForObject(
                 "SELECT count(*)::int FROM pg_namespace WHERE nspname = ?", Integer.class, schema);

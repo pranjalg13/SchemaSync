@@ -307,6 +307,63 @@ exists to provide. Refusing is one line and removes the whole category.
 
 ---
 
+## 15. Measured: what the online path actually buys
+
+The same change (`amount_cents` from `integer` to `numeric(14,2)`) on the same 2,000,000-row,
+354MB table, with four clients doing continuous `SELECT` + `UPDATE` against it
+(`scripts/zero_downtime_demo.py`):
+
+| | Naive `ALTER TABLE` | SchemaSync online |
+| --- | --- | --- |
+| Wall clock | **4.9s** | 75.3s |
+| Requests served during | 2,525 | 27,838 |
+| Failed requests | 0 | 0 |
+| p99 latency | 11.6 ms | 31.0 ms |
+| **Worst single request** | **4,894 ms** | **1,112 ms** |
+
+Read those numbers honestly, because they do not say "the online path is better at everything":
+
+- **The online path is 15× slower in wall clock.** It does strictly more work — a shadow column, a
+  trigger on every write, a full backfill in throttled batches, a validation scan. If you have a
+  maintenance window and nobody is using the database, the naive `ALTER` is the right call and this
+  machinery is waste.
+- **The naive run reports zero failures too.** That is the trap: nothing errored, so a migration
+  tool could truthfully claim success. What actually happened is that every request arriving during
+  those 4.9 seconds sat in the lock queue — the worst one for 4.9 seconds. Nobody got an error;
+  everybody got a hung page. This is why the demo reports worst-case latency and not just an error
+  count, and why "no errors" is not the metric the product optimises.
+- **1,112ms is not zero, and the promise was never that it would be.** The stated guarantee is that
+  no `ACCESS EXCLUSIVE` lock is *held* for more than milliseconds and no DDL *waits* more than a few
+  seconds. The worst wait came from the swap step queueing behind four active writers, bounded by
+  the 2s `lock_timeout` exactly as designed. A quieter table would show a much smaller number.
+
+The honest summary: the online path trades total duration for bounded impact. That is the right
+trade during business hours and the wrong one at 3am with the site drained.
+
+---
+
+## 16. Drift detection needed an escape hatch
+
+**Chose:** added `POST /branches/{id}/refresh`, which re-introspects a branch's live schema and
+records it as a new commit, clearing the `DRIFTED` state.
+
+**Found by:** running the zero-downtime demo. I reset a column type with raw `psql` between runs,
+which is exactly the out-of-band change drift detection exists to catch — and it caught it. But
+then the branch was stuck: the error message said "re-import or revert it before making further
+changes" and there was no way to do either.
+
+**Reasoning:** a safety mechanism that detects a problem and offers no way out is not a safety
+mechanism, it is a trap. And the person most likely to hit it is someone who just fixed something
+by hand during an incident, which is the worst possible moment to be told the tool will no longer
+help them.
+
+**What it costs, stated in the code and the API:** re-import has no intent to work from, so a
+column renamed by hand comes back as a *new* column with a new stable ID. That means a rename
+performed outside SchemaSync will subsequently merge as a drop plus an add — precisely the outcome
+the identity model exists to prevent. The escape hatch restores usability, not history.
+
+---
+
 ## Deliberately cut, with reasons
 
 | Cut | Why |

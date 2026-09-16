@@ -109,6 +109,21 @@ public class SchemaSyncController {
         )).toList();
     }
 
+    /**
+     * Re-records the branch's live schema, clearing drift.
+     *
+     * <p>The counterpart to drift detection: detecting a problem you give the user no way to fix
+     * is not a safety feature, it is a dead end.
+     */
+    @PostMapping("/branches/{branchId}/refresh")
+    public Dtos.CommitView refresh(@PathVariable UUID branchId,
+                                   @RequestBody(required = false) Dtos.CreateBranchRequest req) {
+        String author = req == null || req.author() == null ? "anonymous" : req.author();
+        Records.Commit commit = branches.refresh(branchId, author);
+        return new Dtos.CommitView(commit.id(), commit.message(), commit.author(), commit.seq(),
+                DateTimeFormatter.ISO_INSTANT.format(commit.createdAt()), List.of());
+    }
+
     @PostMapping("/branches/{branchId}/operations")
     public Dtos.CommitView apply(@PathVariable UUID branchId, @RequestBody Dtos.ApplyRequest req) {
         List<SchemaOperation> ops = req.operations().stream()
