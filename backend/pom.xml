@@ -20,6 +20,12 @@
   <properties>
     <java.version>21</java.version>
     <maven.compiler.release>21</maven.compiler.release>
+    <!-- Spring Boot 3.4's BOM pins Testcontainers 1.20.x, which pings the daemon advertising
+         Docker API 1.32. Docker 29 (what OrbStack ships) removed support for anything below
+         1.40 and rejects the client, so Testcontainers reports "could not find a valid Docker
+         environment". That reads like a misconfigured machine but is a version incompatibility;
+         1.21.4 is the first release that negotiates correctly. -->
+    <testcontainers.version>1.21.4</testcontainers.version>
   </properties>
 
   <dependencies>

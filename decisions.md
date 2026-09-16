@@ -235,6 +235,30 @@ needs converters for. One idiom, explicit SQL, and no `ddl-auto` footgun is the 
 
 ---
 
+## 12. Testcontainers over a shared test database
+
+**Chose:** every integration test runs against a real Postgres 16 in Testcontainers, one container
+shared across the suite, with each test isolating itself in its own schema.
+
+**Considered:** pointing tests at the Compose Postgres, or an in-memory substitute like H2.
+
+**Reasoning:** H2 is disqualified outright. This entire product is a set of claims about what
+specific DDL does in Postgres — which operations rewrite a table, which take `ACCESS EXCLUSIVE`,
+whether `SET NOT NULL` skips its scan when a validated `CHECK` exists. Only Postgres can adjudicate
+those, so a test against anything else would prove nothing. A shared Compose database would work
+but makes `mvn verify` depend on external state a reviewer has to set up first.
+
+**A real snag worth recording**, since it cost time and would cost a reviewer the same: Spring Boot
+3.4's BOM pins Testcontainers 1.20.x, which pings the daemon advertising Docker API **1.32**.
+Docker 29 — what OrbStack currently ships — removed support for anything below 1.40 and rejects the
+client. The symptom is `Could not find a valid Docker environment`, which reads like a misconfigured
+machine rather than a version incompatibility, and sends you looking at socket paths. It is neither:
+pinning Testcontainers to **1.21.4** fixes it. I also tried overriding docker-java to 3.5.3 on the
+theory that the version came from the transport layer; it did not, and the override was removed
+again rather than left in the pom as cargo cult.
+
+---
+
 ## Deliberately cut, with reasons
 
 | Cut | Why |
