@@ -1,0 +1,249 @@
+# Decisions
+
+A running log of the real calls made while building SchemaSync, in the order they came up.
+Each entry is: what I chose, what else I seriously considered, why, and what I cut.
+
+---
+
+## 1. Which problem, and what "version control for a database" means here
+
+**Chose:** schema version control — branch / diff / merge for the *structure* of a Postgres
+database, with every change applied to a real database.
+
+**Considered:** data version control (Dolt-style row-level history), or a hybrid.
+
+**Reasoning:** the brief asks for "add, drop, rename, and retype columns; change constraints and
+indexes; create and drop tables" — that is entirely a schema vocabulary. It also says the solution
+must "work smoothly even if the table has ~5GB of data", which I read as *the data is the
+constraint, not the content*: the thing being versioned is small, the thing it sits on top of is
+large. Data-level merge is a multi-year product (Dolt has been building it since 2018); schema
+merge done properly in five days is a better use of the time.
+
+**Cut:** row-level history, time-travel queries, data merges.
+
+---
+
+## 2. The hard sub-problem to go deep on
+
+**Chose:** two, treated as one system — (a) rename-aware three-way merge, (b) a migration executor
+that applies the merged result to a large table without downtime.
+
+**Considered:** going deep on only the merge algebra, or only the online-migration machinery.
+
+**Reasoning:** they are the same problem seen from two ends. A merge that emits `DROP COLUMN` +
+`ADD COLUMN` where the user meant a rename is not just wrong, it destroys data — so merge
+correctness *is* a safety property, not just a UX nicety. And a correct merge that then locks a 5GB
+table for four minutes is not shippable. Doing one without the other leaves an obvious hole.
+
+**Accepted tradeoff:** less breadth elsewhere. No auth, no multi-engine support, no data merges.
+
+---
+
+## 3. Snapshots per commit, not an operation log to replay
+
+**Chose:** each commit stores the **full canonical schema as JSONB**, keyed by stable object ID.
+
+**Considered:**
+- *Operation log + replay.* Diff becomes O(history); every read has to reconstruct state; and a bug
+  in replay silently corrupts every downstream answer with no way to notice.
+- *Normalised versioned object tables* (`valid_from` / `valid_to` on column rows). This one is
+  genuinely tempting and I rejected it for a specific reason: temporal validity ranges assume a
+  **linear** timeline. Branching is a DAG. You end up re-implementing a version DAG inside SQL
+  predicates, which is both slow and very hard to test.
+
+**Reasoning:** three-way merge needs base, ours and theirs *simultaneously*. With snapshots that is
+three primary-key lookups followed by a pure in-memory function — which means the entire merge
+engine is unit-testable with plain JUnit and no database at all. Snapshots are a few hundred KB;
+the storage cost is irrelevant at this scale. Git itself stores snapshots rather than diffs for the
+same reason.
+
+The operation log is still written — it powers the history view and the audit trail — but it is
+**never the source of truth for state**. That separation means a bug in the op log cannot corrupt a
+schema.
+
+---
+
+## 4. Stable object IDs, so a rename is never inferred
+
+**Chose:** every table, column, constraint and index gets a **stable ULID at creation**, carried
+unchanged through renames. Diff compares by ID; `name` is an ordinary attribute.
+
+**Considered:** heuristic rename detection — compare two snapshots and guess which drop+add pair is
+"really" a rename, using type equality, ordinal position and name similarity.
+
+**Reasoning:** heuristic detection fails in both directions and the failures are invisible at
+review time.
+- A **false negative** emits `DROP COLUMN` + `ADD COLUMN`. On a 5GB table that is data destroyed
+  where the user intended a free catalog update.
+- A **false positive** emits `ALTER ... RENAME` where a genuinely new column was meant, silently
+  resurfacing old data under new semantics.
+
+It also has no signal in the common case — a table with five `text NOT NULL` columns offers nothing
+to match on — and it degrades exactly when you need it most, because renaming *and* retyping in one
+step erases both signals. Any similarity threshold is a tuning parameter, and a tuning parameter
+cannot be unit-tested to a correct answer.
+
+**What this costs:** identity only holds if every change comes through our API. Someone running DDL
+directly against a branch schema breaks it. Mitigated by drift detection (§7), not ignored.
+
+---
+
+## 5. A fixed 9-button palette instead of free-form SQL
+
+**Chose:** the branch editor exposes exactly nine operations — add / drop / rename column, change
+type, toggle nullable, set-drop default, create / drop table, add-drop index.
+
+**Considered:** a raw DDL text box (parse it and map to our model), or a hybrid.
+
+**Reasoning:** this looked like a scope cut and turned out to be a load-bearing design decision.
+Accepting free-form SQL means writing a Postgres DDL parser, and — much worse — it means rename
+intent has to be *inferred* again, which is exactly the failure mode §4 exists to prevent. With a
+fixed palette, every click produces one typed operation record against a known object ID, and the
+conflict matrix becomes finite and enumerable: nine verbs over a fixed attribute set. That is what
+makes it possible to give every conflict a predetermined resolution UI rather than a
+general-purpose merge editor.
+
+**Cut, with a compromise:** constraints (PK/FK/UNIQUE/CHECK) are introspected, displayed and
+carried faithfully through branch and merge, but are not editable in v1. A **read-only** `SELECT`
+console per branch gives most of the value of a SQL box at none of the identity risk.
+
+---
+
+## 6. Branches are Postgres schemas with sampled data, not copies
+
+**Chose:** a branch is a real Postgres schema (namespace) containing the same tables, seeded with a
+bounded sample (~1,000 rows per table).
+
+**Considered:**
+- *Empty tables.* Cheapest, but you cannot sanity-check a migration against anything, and cast
+  failures only surface at merge time.
+- *`CREATE DATABASE ... TEMPLATE`.* Requires **zero other connections** to the template database,
+  so you would have to evict everyone from `main` in order to branch. Fatal for "branching feels
+  instant."
+- *Full data copy.* Minutes and gigabytes per branch. This is precisely the trap the "~5GB"
+  constraint is testing for.
+- *Copy-on-write at the storage layer* (ZFS snapshots, Neon, Aurora clones). This is the correct
+  answer at product scale and I want to be clear that I know it — it needs control of the storage
+  layer and a Postgres process per branch, which is not a five-day deliverable.
+
+**Reasoning:** branch creation stays O(schema), not O(data), so it takes the same ~200ms whether
+`main` holds 5MB or 5GB — while still giving a real, connectable, queryable database.
+
+**The honest tradeoff, stated plainly:** a branch is structurally real but not data-real. You
+*cannot* prove a destructive cast is safe from inside the branch. That loop is closed at merge time
+by running pre-flight validation against the actual target table (§9) — which is where the
+interesting engineering went anyway.
+
+---
+
+## 7. Canonicalisation, and drift detection
+
+**Chose:** normalise every introspected type and expression before hashing, and store a SHA-256
+content hash per snapshot.
+
+**Reasoning:** this is the landmine under every schema-diff tool. Postgres rewrites what you give
+it: `character varying(50)` vs `varchar(50)`, `int4` vs `integer`, `serial` (which is really
+`integer` plus a sequence plus a default), `'x'` stored as `'x'::text`, `now()` vs
+`CURRENT_TIMESTAMP`. Without a canonicaliser you get phantom diffs on *every* import and the
+content hashes are meaningless. It cost about half a day and it is the difference between a demo
+and a tool.
+
+The hash pays for itself twice: no-op commits are free to detect, and so is **drift** — before any
+diff or merge we re-introspect the branch, canonicalise, and compare against the head snapshot. A
+mismatch marks the branch `DRIFTED` and blocks the merge. That turns the silent-corruption failure
+mode of §4 into a visible, honest error.
+
+---
+
+## 8. Unsupported objects are detected and refused, never silently ignored
+
+**Chose:** views, triggers, functions, partitions, enums, materialised views and RLS policies are
+detected during introspection and the schema is marked *partially managed*; operations that would
+touch them are blocked.
+
+**Considered:** just omitting them from the snapshot.
+
+**Reasoning:** omitting them is actively dangerous rather than merely incomplete. The merge plan is
+computed as `diff(target, merged)` — so an object that is missing from the snapshot looks exactly
+like an object the user deleted, and the merge would cheerfully drop it from the real database. A
+loud, named limitation is worth far more than fake breadth, and it is a much smaller amount of code
+than supporting them properly.
+
+---
+
+## 9. The executor: what "zero downtime" actually promises
+
+**Chose, and stated in the product:**
+
+> No `ACCESS EXCLUSIVE` lock is *held* for more than a few milliseconds, and no DDL statement
+> *waits* for a lock for more than a few seconds.
+
+**Reasoning:** "online" does not mean "instant", and conflating the two is how people end up
+trusting a tool that then takes their site down. A 5GB backfill takes minutes no matter what. What
+it *can* promise is that reads never block and writes block only momentarily. Being precise about
+this is the whole design.
+
+The corollary is that the naive statement is never emitted. `ALTER COLUMN TYPE` on a large table
+compiles to expand → sync trigger → batched backfill → validate → swap. The
+ordering within that is not arbitrary, and two orderings in particular are the difference between
+working and breaking production — both documented inline in the executor:
+
+- The **sync trigger must commit in its own transaction, before the first backfill batch**. That is
+  what guarantees no gap: `CREATE TRIGGER` waits for in-flight writers, and every writer starting
+  afterwards sees it, so every row is covered by either the trigger or the backfill.
+- The **`CHECK ... NOT VALID` goes after the backfill, not before**. A `NOT VALID` constraint is
+  still enforced for new row versions, so adding it while NULLs remain makes any `UPDATE` touching
+  one of those rows fail — silently breaking writes for a subset of rows for the whole backfill.
+
+**Cut:** shadow-*table* rewrites (the `pg_repack` / `pgroll` / `gh-ost` model). That is 2+ days on
+its own. Shadow *column* covers the operations in our palette. Also cut: online primary-key type
+changes with foreign-key repointing — detected and **refused** with an explanation, because
+refusing intelligently is better than attempting it badly.
+
+---
+
+## 10. Postgres as the job queue, rather than a job framework
+
+**Chose:** `FOR UPDATE SKIP LOCKED` to claim runs, a heartbeat column to reclaim crashed ones, and
+all step state in tables.
+
+**Considered:** Quartz, or a queue plus workers.
+
+**Reasoning:** the state has to be in Postgres regardless — resumability is a hard requirement,
+since a backfill that cannot resume will eventually be a backfill that restarts from zero ten
+minutes in. Once the state is there, `SKIP LOCKED` gives a correct multi-instance work queue in a
+single statement. Adding a broker would introduce a second failure domain to buy nothing.
+
+Two details that matter more than the queue choice: the migration executor gets its **own
+connection pool**, so a stuck migration cannot starve the API; and every step carries an
+`isAlreadyApplied()` catalog probe, so resume never has to trust our own bookkeeping.
+
+---
+
+## 11. `JdbcTemplate` throughout, no JPA
+
+**Chose:** plain `JdbcTemplate` with hand-written row mappers for the control plane, as well as for
+all DDL against the target.
+
+**Considered:** JPA/Hibernate for the metadata tables (which is what I initially planned).
+
+**Reasoning:** JPA is the wrong tool for the target database — you cannot express
+`CREATE INDEX CONCURRENTLY` or a lock-timeout-wrapped `ALTER TABLE` through an ORM — so it was only
+ever going to cover the control plane. That would mean two persistence idioms in one codebase to
+save very little: the control plane is about ten tables, several of which store JSONB that JPA
+needs converters for. One idiom, explicit SQL, and no `ddl-auto` footgun is the simpler system.
+
+---
+
+## Deliberately cut, with reasons
+
+| Cut | Why |
+| --- | --- |
+| Data-level branching and merging | A multi-year product on its own. Schema is the stated vocabulary of the brief. |
+| Free-form SQL editing | Destroys rename intent (§4, §5). Read-only query console instead. |
+| Storage-level CoW branching | The right answer at scale; needs the storage layer. This is the "what I'd build next". |
+| Rebase, cherry-pick | Branch from a base, merge back. Enough to demonstrate the model. |
+| **Revert of an applied merge** | Cut on *principle*, not time. `DROP COLUMN` is not invertible — the data is gone. Offering "undo" would be a lie. Instead: reversible up to an explicit point-of-no-return step, which the UI gates. |
+| Multi-engine (MySQL, etc.) | A dialect abstraction built for a second engine that never arrives is the canonical over-engineering trap. |
+| Auth, RBAC, multi-tenancy | An author name field, no login. Not what is being evaluated. |
+| Real 5GB in CI | Correctness tests run against ~200k rows via Testcontainers. The 5GB run is a documented manual validation. |

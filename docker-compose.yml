@@ -1,0 +1,53 @@
+# One command to a running SchemaSync: `docker compose up`.
+# Verified against OrbStack (Docker CLI 29 / Compose v5).
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: schemasync
+      POSTGRES_USER: schemasync
+      POSTGRES_PASSWORD: schemasync
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    command:
+      # log_lock_waits gives free server-side evidence for the lock-contention demo.
+      - "postgres"
+      - "-c"
+      - "log_lock_waits=on"
+      - "-c"
+      - "deadlock_timeout=1s"
+      - "-c"
+      - "max_connections=100"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U schemasync -d schemasync"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build:
+      context: ./backend
+    environment:
+      SCHEMASYNC_DB_URL: jdbc:postgresql://db:5432/schemasync
+      SCHEMASYNC_DB_USER: schemasync
+      SCHEMASYNC_DB_PASSWORD: schemasync
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./web
+    environment:
+      VITE_API_BASE: http://localhost:8080
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

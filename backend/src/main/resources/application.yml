@@ -1,0 +1,58 @@
+spring:
+  application:
+    name: schemasync
+  datasource:
+    url: ${SCHEMASYNC_DB_URL:jdbc:postgresql://localhost:5432/schemasync}
+    username: ${SCHEMASYNC_DB_USER:schemasync}
+    password: ${SCHEMASYNC_DB_PASSWORD:schemasync}
+    hikari:
+      pool-name: schemasync-api
+      maximum-pool-size: 10
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # Flyway manages the sv control-plane schema only. Branch schemas are created
+    # at runtime by the branching service, never by a migration.
+    schemas: sv
+    default-schema: sv
+    create-schemas: true
+
+server:
+  port: ${PORT:8080}
+
+schemasync:
+  # The project's canonical schema. "main is just a branch" -- this is simply the
+  # schema that the branch named 'main' is bound to.
+  main-schema: main
+  branch-schema-prefix: br_
+  # Rows copied per table when materialising a branch. Branch creation stays O(schema),
+  # not O(data): this is what makes branching a 5GB table feel instant.
+  branch-sample-rows: 1000
+
+  migration:
+    # Bounds how long a lock queue can build behind a waiting DDL. See decisions.md.
+    lock-timeout: 2s
+    # Tripwire: if an operation classified metadata-only actually rewrites, it dies
+    # here instead of holding ACCESS EXCLUSIVE over a full table rewrite.
+    ddl-statement-timeout: 15s
+    validate-statement-timeout: 30min
+    batch-statement-timeout: 30s
+    max-lock-retries: 25
+    max-backoff: 60s
+    # Backfill batches converge on this duration via AIMD rather than being fixed.
+    target-batch-duration: 250ms
+    initial-batch-size: 1000
+    min-batch-size: 100
+    max-batch-size: 50000
+    # Sleep this fraction of each batch's duration between batches, leaving headroom
+    # for autovacuum and normal traffic.
+    throttle-ratio: 0.25
+    # Above this row count, an operation needing a scan or rewrite switches the run
+    # from ATOMIC to ONLINE mode.
+    online-mode-row-threshold: 100000
+    heartbeat-interval: 10s
+    stale-claim-after: 60s
+
+logging:
+  level:
+    com.schemasync: INFO
