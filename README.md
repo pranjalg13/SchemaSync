@@ -17,11 +17,28 @@ Requires Docker (or OrbStack) and nothing else.
 
 ```bash
 git clone <this repo> && cd SchemaSync
-docker compose up
+docker compose up --build
 ```
 
 Then open **http://localhost:5173**. The stack seeds itself with a demo e-commerce schema, so
 there is nothing to configure before you can branch something.
+
+Use `--build`. Compose reuses a previously built image otherwise, and a stale API image produces
+confusing 404s on endpoints that exist in the source.
+
+<details>
+<summary>If the UI says the API did not respond</summary>
+
+Two causes, in order of likelihood:
+
+1. **Something else is already on port 5173.** A dev server left running from an earlier session
+   binds `localhost` and intercepts the request before Docker's published port sees it — on macOS
+   `localhost` resolves to IPv6 first, so this happens even when Docker looks correctly bound.
+   Check with `lsof -nP -iTCP:5173 -sTCP:LISTEN` and stop anything that is not OrbStack/Docker.
+2. **A stale image.** `docker compose up --build --force-recreate`.
+
+To confirm the API itself is healthy, bypass the proxy: `curl localhost:8080/api/health`.
+</details>
 
 To work on the backend directly instead:
 

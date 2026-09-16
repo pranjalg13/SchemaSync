@@ -38,16 +38,35 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      # So `web` waits for a server that actually answers, not just a started container.
+      test: ["CMD", "sh", "-c", "wget -qO- http://localhost:8080/api/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
 
   web:
     build:
       context: ./web
     environment:
-      VITE_API_BASE: http://localhost:8080
+      # Must be the SERVICE name, not localhost. The Vite dev server proxies /api from inside this
+      # container, where "localhost" is the web container itself -- so localhost:8080 gets a
+      # connection refused, which reaches the browser as a 502 from the proxy.
+      VITE_API_BASE: http://api:8080
     ports:
       - "5173:5173"
+    volumes:
+      # Mount the source so the running container always reflects the repo. Without this, editing
+      # a file and restarting gives you the copy baked into the image, which looks like your change
+      # silently did nothing. node_modules deliberately stays from the image.
+      - ./web/src:/app/src
+      - ./web/index.html:/app/index.html
+      - ./web/vite.config.ts:/app/vite.config.ts
+      - ./web/tsconfig.json:/app/tsconfig.json
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
 volumes:
   pgdata:

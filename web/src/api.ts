@@ -9,7 +9,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // The API returns a real explanation for user errors, so surface it rather than
     // replacing it with a status code. "Something went wrong" makes a tool unusable.
     const body = await res.json().catch(() => null)
-    throw new Error(body?.error ?? `Request failed (${res.status})`)
+    if (body?.error) throw new Error(body.error)
+    // 502/504 come from the dev-server proxy, not the API: the request never arrived. That is a
+    // specific, fixable situation, so name it instead of reporting a bare status code.
+    if (res.status === 502 || res.status === 504) {
+      throw new Error(
+        'The API did not respond. If you started this with docker compose, check `docker compose ' +
+        'logs api`; if you are running the backend yourself, make sure it is up on port 8080.')
+    }
+    throw new Error(`Request failed (${res.status})`)
   }
   return res.status === 204 ? (undefined as T) : res.json()
 }
