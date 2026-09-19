@@ -346,25 +346,28 @@ public final class MigrationPlanner {
 
         // 2. Sync trigger, own transaction, before any backfill. See the method comment.
         add(group, MigrationStep.Kind.DDL,
-                "Install a trigger so writes during the migration stay correct "
-                        + "(blocks writes for well under a second)",
+                "Create the sync function (touches no table)",
                 "CREATE OR REPLACE FUNCTION " + DdlSql.qualify(schema, function) + "() "
                         + "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW."
                         + DdlSql.quote(shadow) + " := NEW." + DdlSql.quote(col.name())
                         + "::" + col.type().sql() + "; RETURN NEW; END $$",
-                Classification.instant("Creates the function only; the table is not touched."),
+                new Classification(Classification.Verdict.INSTANT, Classification.LockMode.NONE,
+                        Classification.Blocks.NOTHING,
+                        "Defines the function in the catalog. No table is locked or read."),
                 true, false, null);
 
         add(group, MigrationStep.Kind.DDL,
-                "Attach the sync trigger",
+                "Attach the sync trigger, so writes during the migration stay correct",
                 "CREATE TRIGGER " + DdlSql.quote(trigger)
                         + " BEFORE INSERT OR UPDATE OF " + DdlSql.quote(col.name())
                         + " ON " + qualified
                         + " FOR EACH ROW EXECUTE FUNCTION " + DdlSql.qualify(schema, function) + "()",
-                Classification.scan(Classification.LockMode.SHARE_ROW_EXCLUSIVE,
+                // INSTANT, not SCAN: CREATE TRIGGER reads no rows. It takes SHARE ROW EXCLUSIVE, so it
+                // waits for in-flight writers and briefly holds new ones -- reads carry on.
+                new Classification(Classification.Verdict.INSTANT, Classification.LockMode.SHARE_ROW_EXCLUSIVE,
                         Classification.Blocks.WRITES,
-                        "Waits for in-flight writers, so every later write sees the trigger. "
-                        + "No table scan."),
+                        "Waits for in-flight writes to finish, so every later write sees the trigger. "
+                        + "Reads are never blocked and no rows are scanned."),
                 true, false, null);
 
         // 3. Backfill existing rows in committed batches.

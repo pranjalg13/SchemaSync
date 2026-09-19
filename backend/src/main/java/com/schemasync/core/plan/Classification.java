@@ -27,6 +27,8 @@ public record Classification(
      * one that turns a slow migration into an outage.
      */
     public enum LockMode {
+        /** Takes no lock on any user table (e.g. CREATE FUNCTION). */
+        NONE,
         ACCESS_EXCLUSIVE, SHARE, SHARE_ROW_EXCLUSIVE, SHARE_UPDATE_EXCLUSIVE
     }
 

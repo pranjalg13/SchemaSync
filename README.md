@@ -20,8 +20,8 @@ git clone <this repo> && cd SchemaSync
 docker compose up --build
 ```
 
-Then open **http://localhost:5173**. The stack seeds itself with a demo e-commerce schema, so
-there is nothing to configure before you can branch something.
+Then open **http://localhost:5173**. On first start the API creates and seeds a demo e-commerce
+schema (200k orders), so there is nothing to configure before you can branch something.
 
 Use `--build`. Compose reuses a previously built image otherwise, and a stale API image produces
 confusing 404s on endpoints that exist in the source.
@@ -53,7 +53,7 @@ cd backend && mvn spring-boot:run
 ```bash
 ./scripts/seed.sh 100000         # ≈15MB   — fast iteration
 ./scripts/seed.sh 3500000        # ≈500MB  — the development default
-./scripts/seed.sh 35000000       # ≈5GB    — the full-scale validation run
+./scripts/seed.sh 35000000       # ≈5GB    — full scale (the largest verified run so far is 2.4M rows)
 ```
 
 Rows are generated server-side with `generate_series`, so seeding 5GB does not stream gigabytes
@@ -88,8 +88,8 @@ Plan — 4 step(s)
 - **Branch** a schema. A branch is a real Postgres schema (namespace) containing the same tables,
   seeded with a bounded row sample. Branch creation is `O(schema)`, not `O(data)` — it takes about
   the same time whether `main` holds 5MB or 5GB.
-- **Evolve** it through a fixed palette of nine operations: add / drop / rename column, change type,
-  toggle nullable, set-drop default, create / drop table, add-drop index. Each one is applied to the
+- **Evolve** it through a fixed set of operations: add / drop / rename column, change type, toggle
+  nullable, set or drop a default, create / drop table, add / drop index. Each is applied to the
   branch's real schema immediately.
 - **Diff** against the branch point. A rename shows as a *rename* — never as a drop plus an add,
   which is the difference between a free catalog update and losing a column of production data.
@@ -99,9 +99,7 @@ Plan — 4 step(s)
 ## Running the tests
 
 ```bash
-cd backend
-mvn verify                 # unit + integration (Testcontainers spins up Postgres)
-mvn verify -Pscale         # adds the slow concurrent-workload test
+cd backend && mvn verify   # 110 unit + integration tests (Testcontainers spins up Postgres)
 ```
 
 There is also an end-to-end walkthrough that drives the real HTTP API against a real database and
@@ -158,12 +156,13 @@ The tests worth looking at first:
 
 | Test | What it actually catches |
 | --- | --- |
-| `SafetyClassifierTest` | Every row of the operation-classification table, with no database. `ADD COLUMN DEFAULT 0` is instant; `DEFAULT now()` rewrites the table. |
-| `RenameIntegrityTest` | A rename-then-merge emits `ALTER ... RENAME` and **zero** `DROP COLUMN`, asserted against the executed statements. This guards the core claim. |
-| `MergeAlgebraTest` | `merge(base, x, x) == x`, `merge(base, x, base) == x`, and symmetry. Catches asymmetry bugs immediately. |
-| `RoundTripPropertyTest` | Materialise A, apply `diff(A, B)`, re-introspect — the canonical hash must equal B's. One property covering differ, planner, orderer and SQL renderer. |
-| `VolatilityContractTest` | Proves the classification against Postgres by comparing `relfilenode` before and after: `DEFAULT now()` must not rewrite the table, `DEFAULT gen_random_uuid()` must. |
-| `MigrationPlannerTest` | The same retype produces 1 step on a small table and a 9-step online plan on a large one, with the sync trigger before the backfill and the swap after it. |
+| `SchemaDiffTest` | A rename diffs as a rename and never as drop + add, including renamed-and-retyped in one step; add-then-drop collapses to nothing. |
+| `ThreeWayMergerTest` | Merge algebra (`merge(b,x,x)=x`, symmetry) and every conflict type, including rename-on-one-side + retype-on-the-other merging cleanly. |
+| `SafetyClassifierTest` | The classification table as executable spec: `varchar(50)→text` is free, `integer→bigint` rewrites, `DEFAULT now()` is instant. |
+| `VolatilityContractTest` | Proves those claims against Postgres by comparing `relfilenode` before and after each change. |
+| `MigrationPlannerTest` | The same retype is 1 step on a small table and a 9-step online plan on a large one, with the sync trigger before the backfill and the swap after it. |
+| `LockSafeExecutorTest` | A blocked DDL gives up instead of queueing; a batch is all-or-nothing; and, with a one-connection pool, migration timeouts never leak into the connection the API reuses. |
+| `TypeCanonicalizerTest` | Every spelling Postgres returns normalises to one form, so re-reading an unchanged schema is a no-op. |
 
 ---
 
@@ -185,8 +184,17 @@ Stated up front rather than discovered.
 - **Zero-downtime is not zero-impact.** A backfill writes several GB of WAL, temporarily grows the
   table by up to 2×, and will increase replica lag. SchemaSync throttles and reports this; it does
   not eliminate it. Check you have ~2× the table size free before a large retype.
+- **No automatic resume.** If the API dies mid-migration, the backfill cursor and every step's
+  status are saved, but nothing restarts the run on boot yet.
 - **No authentication.** There is an author name field and no login. Do not point this at a
   production database you care about.
+
+---
+
+## Deploying
+
+One free web service plus one free Postgres. See **[DEPLOY.md](DEPLOY.md)** — it covers Render +
+Neon, the one setting that breaks on Neon if you miss it, and what "free" costs you in cold starts.
 
 ---
 
@@ -201,18 +209,24 @@ commit stores a full canonicalised schema snapshot as JSONB, keyed by stable obj
 survive renames — which makes diff and three-way merge pure functions over immutable documents,
 testable without a database. Merging computes `diff(target, merged)`, lowers it to a dependency-
 ordered plan, classifies every step as instant / scan / rewrite, and executes it either atomically
-(one transaction, when everything is metadata-only) or online (staged, resumable, with batched
-backfill) when something needs to touch every row.
+(one transaction, when everything is metadata-only) or online (staged, with a batched backfill whose
+cursor commits alongside each batch) when something needs to touch every row.
 
 ```
 backend/src/main/java/com/schemasync/
-  core/model    immutable snapshots, canonicalisation, content hashing
-  core/diff     two-way and three-way diff, rename-aware
-  core/merge    merge base, attribute-level merge, conflict taxonomy
-  core/plan     safety classification, plan compilation, dependency ordering
-  catalog       pg_catalog introspection
-  exec          lock-safe DDL, batched backfill, concurrent index builds
-  api           REST + SSE progress
+  core/model    immutable snapshots, canonicalisation, content hashing   (pure Java)
+  core/diff     ID-keyed diff: rename vs drop vs retype                  (pure Java)
+  core/merge    attribute-level three-way merge, conflict severities     (pure Java)
+  core/plan     safety classifier, migration planner, DDL rendering      (pure Java)
+  ops           the operation set, applying it to a branch
+  catalog       pg_catalog -> canonical snapshot
+  branch        import, branch (schema + sample), drift, refresh, demo seed
+  merge         merge base, prepare + pre-flight, migration runner
+  exec          lock-safe DDL, batched backfill, identifier quoting
+  store         control-plane persistence (schema sv)
+  api           REST; the UI polls run progress
+  config        DATABASE_URL support for hosted Postgres
+web/src         React UI (Vite); built into the jar for production
 ```
 
 `core/*` has no Spring and no JDBC on purpose: the entire diff, merge and planning engine runs in

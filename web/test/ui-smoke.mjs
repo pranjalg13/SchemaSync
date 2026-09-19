@@ -82,20 +82,57 @@ try {
     fail(`expected 1 rename and 0 drops, got ${renames.length} and ${drops.length}`)
   }
 
-  // The destructive path must require typing the name, not just a click.
+  // A rejected submit must keep the dialog open, show the server's reason, and keep the input.
+  // The first version closed the dialog before the request finished and lost what was typed.
+  await ordersCard.getByRole('button', { name: 'Add column' }).click()
+  const add = page.locator('.modal')
+  await add.waitFor({ timeout: 5000 })
+  await add.locator('input').first().fill('customer_id')          // already exists on orders
+  await add.getByRole('button', { name: 'Add column' }).click()
+  await add.locator('.form-error').waitFor({ timeout: 10000 })
+  if (await add.locator('input').first().inputValue() === 'customer_id') {
+    pass('a rejected submit keeps the dialog open, explains why, and keeps the input')
+  } else {
+    fail('the dialog lost the user input after a rejected submit')
+  }
+  if (shotDir) await page.screenshot({ path: `${shotDir}/ui-form-error.png` })
+  await page.keyboard.press('Escape')
+  await add.waitFor({ state: 'detached', timeout: 5000 })
+
+  // The destructive path must require typing the name; the button stays disabled until then.
   const notesRow = ordersCard.locator('.row', { hasText: 'notes' }).first()
   await notesRow.locator('button', { hasText: 'Drop' }).click()
   const confirm = page.locator('.modal')
   await confirm.waitFor({ timeout: 5000 })
   const dropBtn = confirm.getByRole('button', { name: /^Drop notes$/ })
-  await dropBtn.click()
-  await page.waitForTimeout(400)
-  if (await confirm.isVisible()) {
-    pass('dropping a column refuses to proceed until the name is typed')
-  } else {
-    fail('destructive confirm accepted a bare click')
-  }
+  if (await dropBtn.isDisabled()) pass('dropping a column is disabled until the name is typed')
+  else fail('destructive confirm was enabled before the name was typed')
   if (shotDir) await page.screenshot({ path: `${shotDir}/ui-confirm.png` })
+  await confirm.locator('input').fill('notes')
+  await dropBtn.click()
+  await confirm.waitFor({ state: 'detached', timeout: 10000 })
+  const afterDrop = await api(`/branches/${branch.id}/diff`)
+  if (afterDrop.changes.some((c) => c.kind === 'COLUMN_DROPPED' && c.object === 'notes')) {
+    pass('typing the name and confirming actually drops the column')
+  } else {
+    fail('confirmed drop did not reach the branch')
+  }
+
+  // Filter matches column names across tables.
+  await page.keyboard.press('/')
+  await page.keyboard.type('customer_id')
+  await page.waitForTimeout(300)
+  const shown = await page.locator('.schema-main .card').count()
+  if (shown >= 1 && shown < 4) pass(`"/" focuses the filter; "customer_id" narrows to ${shown} table(s)`)
+  else fail(`filter showed ${shown} tables`)
+  await page.keyboard.press('Escape')
+
+  // N opens the New branch dialog (the last prompt() in the app, replaced).
+  await page.locator('body').click({ position: { x: 5, y: 300 } })
+  await page.keyboard.press('n')
+  const nb = page.locator('.modal', { hasText: 'New branch' })
+  await nb.waitFor({ timeout: 5000 })
+  pass('"N" opens the New branch dialog')
   await page.keyboard.press('Escape')
 
   await page.locator('nav.tabs button', { hasText: 'Merge' }).click()

@@ -107,11 +107,14 @@ public class MigrationRunner {
                 jdbc.update("UPDATE sv.migration_run SET status='RUNNING', started_at=now(), "
                         + "heartbeat_at=now() WHERE id=?", runId);
 
-                for (MigrationStep step : plan.steps()) {
-                    if (!runStep(runId, step)) {
-                        markRunFailed(runId, "STEP_FAILED", "Step " + step.seq() + " failed.");
-                        return;
-                    }
+                boolean ok = plan.mode() == MigrationPlan.Mode.ATOMIC
+                        ? runAtomically(runId, plan)
+                        : plan.steps().stream().allMatch(step -> runStep(runId, step));
+                if (!ok) {
+                    markRunFailed(runId, "STEP_FAILED", plan.mode() == MigrationPlan.Mode.ATOMIC
+                            ? "A step failed, so the whole plan was rolled back. Nothing was changed."
+                            : "A step failed. Steps before it were applied; see the step list.");
+                    return;
                 }
 
                 finish(runId, mergeRequestId, merged, sourceBranchId, targetBranchId, baseCommitId, author);
@@ -134,6 +137,38 @@ public class MigrationRunner {
                 return rs.next() && rs.getBoolean(1);
             }
         }
+    }
+
+    /**
+     * Runs every statement of an ATOMIC plan in ONE transaction.
+     *
+     * <p>The planner marks a plan ATOMIC only when every step is transactional, catalog-only DDL,
+     * and Postgres has transactional DDL -- so the whole plan can genuinely commit or roll back as
+     * a unit. The first version ignored the mode and ran each step in its own transaction, which
+     * meant the UI's "all or nothing" badge was untrue: a failure at step 3 left steps 1 and 2
+     * applied.
+     */
+    private boolean runAtomically(UUID runId, MigrationPlan plan) {
+        List<Long> stepIds = plan.steps().stream()
+                .map(s -> jdbc.queryForObject("SELECT id FROM sv.migration_step WHERE run_id=? AND seq=?",
+                        Long.class, runId, s.seq()))
+                .toList();
+        stepIds.forEach(id -> setStepStatus(id, "RUNNING", null, null, null));
+
+        List<String> statements = plan.steps().stream()
+                .flatMap(s -> java.util.Arrays.stream(s.sql().split(";\\s*\\n")))
+                .toList();
+        LockSafeExecutor.Result r = executor.runDdlBatch(statements, runId.toString());
+
+        for (Long id : stepIds) {
+            if (r.success()) {
+                setStepStatus(id, "SUCCEEDED", null, null, r.lockWaitMs());
+            } else {
+                setStepStatus(id, "FAILED", r.sqlState(),
+                        "Rolled back with the rest of the plan: " + r.error(), r.lockWaitMs());
+            }
+        }
+        return r.success();
     }
 
     private boolean runStep(UUID runId, MigrationStep step) {

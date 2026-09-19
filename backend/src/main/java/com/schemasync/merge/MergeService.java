@@ -68,6 +68,14 @@ public class MergeService {
                     + "recorded schema. Someone changed it outside SchemaSync, so a merge would be "
                     + "computed against information we know is wrong.");
         }
+        // The target matters more than the source: the plan is diff(target, merged), so a stale
+        // target snapshot produces DDL aimed at a schema that no longer exists -- a rename of a
+        // column someone already renamed by hand, an ADD of one that is already there.
+        if (branches.checkDrift(targetBranchId)) {
+            throw new IllegalStateException("'" + target.name() + "' has changed outside SchemaSync "
+                    + "since it was last recorded, so a plan computed now would be aimed at a schema "
+                    + "that no longer exists. Re-import it first.");
+        }
 
         UUID baseCommitId = mergeBase.find(target.headCommitId(), source.headCommitId())
                 .orElse(source.baseCommitId());

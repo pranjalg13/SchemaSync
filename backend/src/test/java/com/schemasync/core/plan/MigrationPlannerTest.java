@@ -205,6 +205,22 @@ class MigrationPlannerTest {
         });
     }
 
+    @Test
+    @DisplayName("attaching the sync trigger is instant and blocks writes, never reads")
+    void triggerIsNotAScan() {
+        // Found in the UI: this step was badged "reads every row" while its own rationale said
+        // "no table scan". CREATE TRIGGER reads no rows; it only waits for in-flight writers.
+        SchemaSnapshot target = ordersSchema();
+        SchemaSnapshot merged = SnapshotMutator.apply(target,
+                new SchemaOperation.ChangeColumnType("tbl_orders", "col_amt", "numeric(14,2)", null));
+        MigrationStep trigger = planFor(target, merged, 40_000_000).steps()
+                .get(indexOfSql(planFor(target, merged, 40_000_000).steps(), "CREATE TRIGGER"));
+
+        assertThat(trigger.classification().verdict()).isEqualTo(Classification.Verdict.INSTANT);
+        assertThat(trigger.classification().blocks()).isEqualTo(Classification.Blocks.WRITES);
+        assertThat(trigger.classification().lock()).isEqualTo(Classification.LockMode.SHARE_ROW_EXCLUSIVE);
+    }
+
     private static int indexOfSql(List<MigrationStep> steps, String fragment) {
         for (int i = 0; i < steps.size(); i++) {
             if (steps.get(i).sql() != null && steps.get(i).sql().contains(fragment)) return i;
