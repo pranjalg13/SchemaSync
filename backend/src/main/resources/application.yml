@@ -28,6 +28,10 @@ schemasync:
   # Rows copied per table when materialising a branch. Branch creation stays O(schema),
   # not O(data): this is what makes branching a 5GB table feel instant.
   branch-sample-rows: 1000
+  demo:
+    # If positive and the main schema does not exist, create and seed it on startup with this
+    # many orders. Never touches an existing schema. 0 disables it.
+    seed-orders: ${SCHEMASYNC_DEMO_SEED_ORDERS:0}
 
   migration:
     # Bounds how long a lock queue can build behind a waiting DDL. See decisions.md.

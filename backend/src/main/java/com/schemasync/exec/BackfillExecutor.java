@@ -6,8 +6,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.Map;
 import java.util.function.Consumer;
@@ -37,10 +37,17 @@ public class BackfillExecutor {
     private static final Logger log = LoggerFactory.getLogger(BackfillExecutor.class);
 
     private final JdbcTemplate jdbc;
+    private final TransactionTemplate tx;
     private final SchemaSyncProperties.Migration config;
 
-    public BackfillExecutor(JdbcTemplate jdbc, SchemaSyncProperties props) {
+    public BackfillExecutor(JdbcTemplate jdbc, PlatformTransactionManager txManager,
+                            SchemaSyncProperties props) {
         this.jdbc = jdbc;
+        // A TransactionTemplate rather than @Transactional on a method of this class: the batch
+        // loop calls it on `this`, and self-invocation bypasses Spring's proxy, so an annotation
+        // there is silently ignored. That is exactly what the first version did -- the batch and
+        // its cursor were committed separately while the comments claimed otherwise.
+        this.tx = new TransactionTemplate(txManager);
         this.config = props.migration();
     }
 
@@ -87,9 +94,22 @@ public class BackfillExecutor {
                     key,
                     target, spec.sourceExpression());
 
+            final String cursorBefore = lastKey;
+            final long doneBefore = rowsDone;
+            final int size = batchSize;
             Map<String, Object> result;
             try {
-                result = runBatch(stepId, sql, batchSize);
+                // The batch UPDATE and the cursor that records it commit in ONE transaction, so
+                // recorded progress can never run ahead of, or fall behind, the data.
+                result = tx.execute(status -> {
+                    jdbc.execute("SET LOCAL statement_timeout = '"
+                            + config.batchStatementTimeout().toMillis() + "ms'");
+                    Map<String, Object> r = jdbc.queryForMap(sql);
+                    String next = (String) r.get("next_cursor");
+                    long updated = ((Number) r.get("updated")).longValue();
+                    persistCursor(stepId, next != null ? next : cursorBefore, doneBefore + updated, size);
+                    return r;
+                });
             } catch (RuntimeException e) {
                 // A cast can fail deep into a backfill -- text to integer meets one bad row at
                 // 14 million. Record the range and stop WITHOUT advancing, so the operator gets
@@ -111,7 +131,6 @@ public class BackfillExecutor {
                 lastKey = nextCursor;
             }
 
-            persistCursor(stepId, lastKey, rowsDone, batchSize);
             progress.accept(new Progress(rowsDone, cursor.rowsEstimated(), batchSize, elapsedMs));
 
             if (scanned < batchSize) {
@@ -123,19 +142,6 @@ public class BackfillExecutor {
             batchSize = adapt(batchSize, elapsedMs);
             throttle(elapsedMs);
         }
-    }
-
-    /**
-     * The batch and its cursor commit together, in their own transaction.
-     *
-     * <p>REQUIRES_NEW because the caller runs inside the migration runner's own transaction
-     * management; the whole point of batching is that each batch is independently durable.
-     */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    protected Map<String, Object> runBatch(long stepId, String sql, int batchSize) {
-        jdbc.execute("SET LOCAL statement_timeout = '"
-                + config.batchStatementTimeout().toMillis() + "ms'");
-        return jdbc.queryForMap(sql);
     }
 
     /**

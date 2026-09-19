@@ -88,11 +88,18 @@ public class LockSafeExecutor {
         long startedAt = System.nanoTime();
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(true);
-            applySessionSettings(conn, runId, null, Duration.ZERO);
-            try (Statement st = conn.createStatement()) {
-                st.execute(sql);
+            // No transaction here (CONCURRENTLY forbids one), so SET LOCAL is not available and
+            // these have to be session-level SETs -- which is exactly why they must be undone
+            // before the connection goes back to the pool. See resetSession.
+            try {
+                applySessionSettings(conn, runId, null, Duration.ZERO, false);
+                try (Statement st = conn.createStatement()) {
+                    st.execute(sql);
+                }
+                return Result.ok(elapsedMs(startedAt), 1);
+            } finally {
+                resetSession(conn);
             }
-            return Result.ok(elapsedMs(startedAt), 1);
         } catch (SQLException e) {
             return Result.failed(e.getSQLState(), e.getMessage(), elapsedMs(startedAt));
         }
@@ -106,8 +113,11 @@ public class LockSafeExecutor {
             long startedAt = System.nanoTime();
             try (Connection conn = dataSource.getConnection()) {
                 conn.setAutoCommit(false);
+                // SET LOCAL, not SET: scoped to this transaction and discarded at commit or
+                // rollback. A plain SET would outlive the migration on this pooled connection and
+                // be inherited by whatever API request borrowed it next.
                 applySessionSettings(conn, runId,
-                        bounded ? config.lockTimeout() : null, statementTimeout);
+                        bounded ? config.lockTimeout() : null, statementTimeout, true);
                 try (Statement st = conn.createStatement()) {
                     for (String sql : statements) {
                         st.execute(sql);
@@ -151,20 +161,43 @@ public class LockSafeExecutor {
                 + "Something is holding a conflicting lock on this table.", totalLockWaitMs);
     }
 
+    /**
+     * Applies the migration's timeouts to a connection.
+     *
+     * <p>These connections come from the same pool the API uses. Found by probing
+     * pg_stat_activity after a migration: session-level SETs survived on the returned connection,
+     * so an ordinary API request later ran with a 15-second statement_timeout and a 2-second
+     * lock_timeout -- enough to kill the pre-flight cast check, which is a full table scan, on a
+     * large table. Hence SET LOCAL wherever there is a transaction, and an explicit reset where
+     * there cannot be one.
+     */
     private void applySessionSettings(Connection conn, String runId, Duration lockTimeout,
-                                      Duration statementTimeout) throws SQLException {
+                                      Duration statementTimeout, boolean local) throws SQLException {
+        String set = local ? "SET LOCAL " : "SET ";
         try (Statement st = conn.createStatement()) {
             // Identifies our sessions in pg_stat_activity, so a DBA watching a migration can see
             // exactly who is doing what.
-            st.execute("SET application_name = 'schemasync-migrator/" + runId + "'");
+            st.execute(set + "application_name = 'schemasync-migrator/" + runId + "'");
             if (lockTimeout != null) {
-                st.execute("SET lock_timeout = '" + lockTimeout.toMillis() + "ms'");
+                st.execute(set + "lock_timeout = '" + lockTimeout.toMillis() + "ms'");
             }
             if (statementTimeout != null) {
-                st.execute("SET statement_timeout = '" + statementTimeout.toMillis() + "ms'");
+                st.execute(set + "statement_timeout = '" + statementTimeout.toMillis() + "ms'");
             }
             // A crashed executor must not be able to hold a lock indefinitely.
-            st.execute("SET idle_in_transaction_session_timeout = '60s'");
+            st.execute(set + "idle_in_transaction_session_timeout = '60s'");
+        }
+    }
+
+    /** Undoes session-level settings before a connection returns to the shared pool. */
+    private static void resetSession(Connection conn) {
+        try (Statement st = conn.createStatement()) {
+            st.execute("RESET application_name");
+            st.execute("RESET lock_timeout");
+            st.execute("RESET statement_timeout");
+            st.execute("RESET idle_in_transaction_session_timeout");
+        } catch (SQLException ignored) {
+            // A connection too broken to reset will be evicted by the pool anyway.
         }
     }
 

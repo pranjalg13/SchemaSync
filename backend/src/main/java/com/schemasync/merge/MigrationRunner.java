@@ -11,9 +11,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.List;
 import java.util.UUID;
 
@@ -38,13 +44,18 @@ public class MigrationRunner {
     private final ControlPlaneStore store;
     private final LockSafeExecutor executor;
     private final BackfillExecutor backfill;
+    private final TransactionTemplate tx;
+    private final DataSource dataSource;
 
-    public MigrationRunner(JdbcTemplate jdbc, ControlPlaneStore store,
-                           LockSafeExecutor executor, BackfillExecutor backfill) {
+    public MigrationRunner(JdbcTemplate jdbc, ControlPlaneStore store, LockSafeExecutor executor,
+                           BackfillExecutor backfill, PlatformTransactionManager txManager,
+                           DataSource dataSource) {
         this.jdbc = jdbc;
+        this.dataSource = dataSource;
         this.store = store;
         this.executor = executor;
         this.backfill = backfill;
+        this.tx = new TransactionTemplate(txManager);
     }
 
     /** Persists a plan so it can be executed, resumed and streamed. */
@@ -80,31 +91,48 @@ public class MigrationRunner {
     public void execute(UUID runId, UUID mergeRequestId, MigrationPlan plan,
                         String targetSchema, SchemaSnapshot merged, UUID sourceBranchId,
                         UUID targetBranchId, UUID baseCommitId, String author) {
-        Boolean acquired = jdbc.queryForObject(
-                "SELECT pg_try_advisory_lock(hashtext(?))", Boolean.class, targetSchema);
-        if (acquired == null || !acquired) {
-            markRunFailed(runId, "LOCKED",
-                    "Another migration is already running against this schema.");
-            return;
-        }
-
-        try {
-            jdbc.update("UPDATE sv.migration_run SET status='RUNNING', started_at=now(), "
-                    + "heartbeat_at=now() WHERE id=?", runId);
-
-            for (MigrationStep step : plan.steps()) {
-                if (!runStep(runId, step)) {
-                    markRunFailed(runId, "STEP_FAILED", "Step " + step.seq() + " failed.");
-                    return;
-                }
+        // The advisory lock is taken and released on ONE dedicated connection held for the whole
+        // run. A session advisory lock belongs to the connection that took it; going through
+        // JdbcTemplate, lock and unlock could each borrow a different pooled connection, so the
+        // unlock would silently do nothing and the lock would outlive the migration. It only
+        // appeared to work because Hikari tends to hand a thread back its last connection.
+        try (Connection lockConnection = dataSource.getConnection()) {
+            lockConnection.setAutoCommit(true);
+            if (!advisoryLock(lockConnection, "pg_try_advisory_lock", targetSchema)) {
+                markRunFailed(runId, "LOCKED",
+                        "Another migration is already running against this schema.");
+                return;
             }
+            try {
+                jdbc.update("UPDATE sv.migration_run SET status='RUNNING', started_at=now(), "
+                        + "heartbeat_at=now() WHERE id=?", runId);
 
-            finish(runId, mergeRequestId, merged, sourceBranchId, targetBranchId, baseCommitId, author);
-        } catch (RuntimeException e) {
-            log.error("Migration {} failed", runId, e);
-            markRunFailed(runId, "ERROR", e.getMessage());
-        } finally {
-            jdbc.queryForObject("SELECT pg_advisory_unlock(hashtext(?))", Boolean.class, targetSchema);
+                for (MigrationStep step : plan.steps()) {
+                    if (!runStep(runId, step)) {
+                        markRunFailed(runId, "STEP_FAILED", "Step " + step.seq() + " failed.");
+                        return;
+                    }
+                }
+
+                finish(runId, mergeRequestId, merged, sourceBranchId, targetBranchId, baseCommitId, author);
+            } catch (RuntimeException e) {
+                log.error("Migration {} failed", runId, e);
+                markRunFailed(runId, "ERROR", e.getMessage());
+            } finally {
+                advisoryLock(lockConnection, "pg_advisory_unlock", targetSchema);
+            }
+        } catch (SQLException e) {
+            log.error("Migration {} could not obtain a connection for its lock", runId, e);
+            markRunFailed(runId, e.getSQLState(), e.getMessage());
+        }
+    }
+
+    private static boolean advisoryLock(Connection conn, String function, String key) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT " + function + "(hashtext(?))")) {
+            ps.setString(1, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
         }
     }
 
@@ -201,10 +229,20 @@ public class MigrationRunner {
         return m.find() ? m.group(1) : null;
     }
 
-    /** Records the merge commit and advances the target branch. */
-    @Transactional
-    protected void finish(UUID runId, UUID mergeRequestId, SchemaSnapshot merged,
-                          UUID sourceBranchId, UUID targetBranchId, UUID baseCommitId, String author) {
+    /**
+     * Records the merge commit and advances the target branch, atomically.
+     *
+     * <p>Via TransactionTemplate: this is called on `this` from execute(), and a @Transactional
+     * annotation on a self-invoked method is silently ignored by Spring's proxy.
+     */
+    private void finish(UUID runId, UUID mergeRequestId, SchemaSnapshot merged,
+                        UUID sourceBranchId, UUID targetBranchId, UUID baseCommitId, String author) {
+        tx.executeWithoutResult(status -> recordMerge(runId, mergeRequestId, merged,
+                sourceBranchId, targetBranchId, author));
+    }
+
+    private void recordMerge(UUID runId, UUID mergeRequestId, SchemaSnapshot merged,
+                             UUID sourceBranchId, UUID targetBranchId, String author) {
         Records.Branch target = store.findBranch(targetBranchId).orElseThrow();
         Records.Branch source = store.findBranch(sourceBranchId).orElseThrow();
 
@@ -223,8 +261,8 @@ public class MigrationRunner {
         log.info("Merged '{}' into '{}' as commit {}", source.name(), target.name(), commit.id());
     }
 
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    protected void setStepStatus(long stepId, String status, String sqlState, String error,
+    /** Each status write is its own autocommit statement, so it is durable the moment it runs. */
+    private void setStepStatus(long stepId, String status, String sqlState, String error,
                                  Long lockWaitMs) {
         jdbc.update("""
                 UPDATE sv.migration_step
@@ -238,8 +276,7 @@ public class MigrationRunner {
                 """, status, sqlState, truncate(error), lockWaitMs, status, status, stepId);
     }
 
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    protected void markRunFailed(UUID runId, String sqlState, String message) {
+    private void markRunFailed(UUID runId, String sqlState, String message) {
         jdbc.update("""
                 UPDATE sv.migration_run
                 SET status='FAILED', finished_at=now(), error_sqlstate=?, error_message=?

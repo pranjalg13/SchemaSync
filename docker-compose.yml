@@ -33,6 +33,9 @@ services:
       SCHEMASYNC_DB_URL: jdbc:postgresql://db:5432/schemasync
       SCHEMASYNC_DB_USER: schemasync
       SCHEMASYNC_DB_PASSWORD: schemasync
+      # A fresh clone has no demo schema; create one so the first screen is something you can
+      # branch rather than an empty state. Ignored once the schema exists.
+      SCHEMASYNC_DEMO_SEED_ORDERS: "200000"
     ports:
       - "8080:8080"
     depends_on:

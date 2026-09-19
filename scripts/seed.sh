@@ -21,30 +21,14 @@ export PGPASSWORD="${PGPASSWORD:-schemasync}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 psql_run() { psql -v ON_ERROR_STOP=1 -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" "$@"; }
 
+DEMO_DIR="$SCRIPT_DIR/../backend/src/main/resources/demo"
+
 echo "==> Creating demo schema (drops and recreates schema \"main\")"
-psql_run -q -f "$SCRIPT_DIR/demo-schema.sql"
+psql_run -q -f "$DEMO_DIR/schema.sql"
 
 echo "==> Seeding ${CUSTOMERS} customers, ${PRODUCTS} products, ${ORDERS} orders"
-psql_run -q <<SQL
-INSERT INTO main.customers (email, full_name)
-SELECT 'customer' || i || '@example.com', 'Customer ' || i
-FROM generate_series(1, ${CUSTOMERS}) AS i;
-
-INSERT INTO main.products (sku, name, price_cents)
-SELECT 'SKU-' || lpad(i::text, 8, '0'), 'Product ' || i, (random() * 50000)::int
-FROM generate_series(1, ${PRODUCTS}) AS i;
-
-INSERT INTO main.orders (customer_id, status, amount, notes, placed_at)
-SELECT (random() * (${CUSTOMERS} - 1))::int + 1,
-       (ARRAY['pending','paid','shipped','delivered','cancelled'])[(random() * 4)::int + 1],
-       (random() * 500000)::int,
-       CASE WHEN random() < 0.7 THEN 'order note ' || i ELSE NULL END,
-       now() - (random() * interval '730 days')
-FROM generate_series(1, ${ORDERS}) AS i;
-SQL
-
-echo "==> Analyzing"
-psql_run -q -c "ANALYZE main.customers; ANALYZE main.products; ANALYZE main.orders;"
+sed -e "s/{{customers}}/${CUSTOMERS}/g" -e "s/{{products}}/${PRODUCTS}/g" -e "s/{{orders}}/${ORDERS}/g" \
+    "$DEMO_DIR/seed.sql" | psql_run -q
 
 psql_run -c "SELECT relname AS table,
                     to_char(n_live_tup, 'FM999,999,999') AS approx_rows,

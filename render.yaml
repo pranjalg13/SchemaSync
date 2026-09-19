@@ -1,0 +1,29 @@
+# Render Blueprint: New > Blueprint > pick this repo.
+#
+# Creates one free web service (this repo's root Dockerfile) and one free Postgres, and wires the
+# database URL in. SchemaSync accepts DATABASE_URL in postgres:// form directly.
+#
+# Render's free Postgres is deleted 30 days after creation. For a demo that has to stay up longer,
+# delete the `databases` block, create a free Neon database instead, and set DATABASE_URL to Neon's
+# DIRECT connection string (not the -pooler one) -- see DEPLOY.md for why.
+services:
+  - type: web
+    name: schemasync
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: schemasync-db
+          property: connectionString
+      - key: SCHEMASYNC_DEMO_SEED_ORDERS
+        # 200k orders is about 30MB -- comfortably inside a 0.5-1GB free database.
+        value: "200000"
+
+databases:
+  - name: schemasync-db
+    plan: free
+    databaseName: schemasync
+    user: schemasync
