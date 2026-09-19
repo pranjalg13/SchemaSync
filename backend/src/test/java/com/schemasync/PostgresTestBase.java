@@ -21,7 +21,10 @@ public abstract class PostgresTestBase {
     @BeforeAll
     static void startContainer() {
         if (postgres == null) {
-            postgres = new PostgreSQLContainer<>("postgres:16-alpine")
+            // Overridable so the suite can run against the version production actually uses
+            // (Neon runs Postgres 18): mvn test -Dschemasync.test.postgres=postgres:18-alpine
+            postgres = new PostgreSQLContainer<>(
+                    System.getProperty("schemasync.test.postgres", "postgres:16-alpine"))
                     .withDatabaseName("schemasync_test")
                     .withUsername("test")
                     .withPassword("test");

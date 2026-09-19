@@ -1,29 +1,24 @@
-# Render Blueprint: New > Blueprint > pick this repo.
+# Render Blueprint: Dashboard -> New -> Blueprint -> pick this repo.
 #
-# Creates one free web service (this repo's root Dockerfile) and one free Postgres, and wires the
-# database URL in. SchemaSync accepts DATABASE_URL in postgres:// form directly.
+# Creates one free web service from the root Dockerfile. The database is Neon, so Render prompts for
+# DATABASE_URL when you apply the Blueprint (sync: false keeps the secret out of this file).
 #
-# Render's free Postgres is deleted 30 days after creation. For a demo that has to stay up longer,
-# delete the `databases` block, create a free Neon database instead, and set DATABASE_URL to Neon's
-# DIRECT connection string (not the -pooler one) -- see DEPLOY.md for why.
+# Paste Neon's DIRECT connection string -- the host WITHOUT "-pooler". In .env.local that is
+# DATABASE_URL_UNPOOLED, not DATABASE_URL. Neon's pooled endpoint is PgBouncer in transaction mode,
+# which drops the session settings and advisory locks the migration executor relies on.
 services:
   - type: web
     name: schemasync
     runtime: docker
     plan: free
+    # Neon project is in AWS us-east-2, which is Render's Ohio region: same region, lowest latency.
+    region: ohio
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: schemasync-db
-          property: connectionString
+        sync: false
       - key: SCHEMASYNC_DEMO_SEED_ORDERS
-        # 200k orders is about 30MB -- comfortably inside a 0.5-1GB free database.
+        # 200k orders is about 30MB -- well inside Neon's free 0.5GB. Seeding only happens when the
+        # demo schema does not exist yet, so redeploys never touch existing data.
         value: "200000"
-
-databases:
-  - name: schemasync-db
-    plan: free
-    databaseName: schemasync
-    user: schemasync
