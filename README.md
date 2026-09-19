@@ -204,7 +204,8 @@ See **[decisions.md](decisions.md)** for the reasoning behind each choice — it
 version, including what was rejected and why.
 
 Architecture in one paragraph: the control plane (schema `sv`) lives in the *same* database as the
-managed branch schemas, so a merge's DDL and its metadata commit can share one transaction. Each
+managed branch schemas, so a branch edit's DDL, its snapshot and its log entry commit in one
+transaction. (A merge records its commit only after its DDL has succeeded.) Each
 commit stores a full canonicalised schema snapshot as JSONB, keyed by stable object IDs that
 survive renames — which makes diff and three-way merge pure functions over immutable documents,
 testable without a database. Merging computes `diff(target, merged)`, lowers it to a dependency-
