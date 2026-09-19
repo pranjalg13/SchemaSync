@@ -54,7 +54,15 @@ public class DemoBootstrap implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
-        importIfMissing();
+        // An exception escaping an ApplicationRunner aborts the whole application. The demo is a
+        // convenience, so a failed seed or import must not take the service down with it -- on a
+        // host that restarts crashed containers, that becomes a crash loop that is hard to read
+        // from a dashboard. Log it; the UI then shows its "no project yet" state.
+        try {
+            importIfMissing();
+        } catch (RuntimeException e) {
+            log.error("Demo bootstrap failed; the API is up but has no demo project", e);
+        }
     }
 
     /**

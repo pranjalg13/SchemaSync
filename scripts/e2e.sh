@@ -26,6 +26,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # a clean control plane every run, so this is repeatable and a reviewer gets the same output.
 if [ "${E2E_SKIP_RESET:-0}" != "1" ]; then
   step "0. Reset to a known state"
+  # /api/health answers while the app may still be seeding its demo data on first boot. Resetting
+  # underneath that races the seeder, so wait (bounded) for startup to finish first.
+  for _ in $(seq 1 30); do
+    [ "$(curl -fsS "$API/projects" 2>/dev/null | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))' 2>/dev/null)" != "0" ] && break
+    sleep 1
+  done
   "${PSQL[@]}" -c "SELECT 'DROP SCHEMA IF EXISTS ' || quote_ident(nspname) || ' CASCADE;'
                    FROM pg_namespace WHERE nspname LIKE 'br\\_%';" \
     | psql -h "${PGHOST:-localhost}" -U "${PGUSER:-schemasync}" -d "${PGDATABASE:-schemasync}" \

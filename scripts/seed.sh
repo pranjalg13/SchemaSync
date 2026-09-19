@@ -2,7 +2,7 @@
 # Seed the demo dataset.
 #
 #   ./scripts/seed.sh              # 3,500,000 orders  (~500MB, the dev default)
-#   ./scripts/seed.sh 35000000     # 35,000,000 orders (~5GB, the Phase 7 validation run)
+#   ./scripts/seed.sh 35000000     # 35,000,000 orders (~5GB, full scale)
 #
 # Generates rows server-side via generate_series, so seeding 5GB does not stream
 # gigabytes through a client connection.
@@ -30,10 +30,13 @@ echo "==> Seeding ${CUSTOMERS} customers, ${PRODUCTS} products, ${ORDERS} orders
 sed -e "s/{{customers}}/${CUSTOMERS}/g" -e "s/{{products}}/${PRODUCTS}/g" -e "s/{{orders}}/${ORDERS}/g" \
     "$DEMO_DIR/seed.sql" | psql_run -q
 
-psql_run -c "SELECT relname AS table,
-                    to_char(n_live_tup, 'FM999,999,999') AS approx_rows,
-                    pg_size_pretty(pg_total_relation_size(relid)) AS total_size
-             FROM pg_stat_user_tables
-             WHERE schemaname = 'main'
-             ORDER BY pg_total_relation_size(relid) DESC;"
+# reltuples, not pg_stat_user_tables.n_live_tup: the stats view double-counts right after a
+# drop-and-recreate (the inserts and the ANALYZE both add to it), and reported 100,000 customers
+# for a table holding 50,000.
+psql_run -c "SELECT c.relname AS table,
+                    to_char(greatest(c.reltuples, 0), 'FM999,999,999') AS approx_rows,
+                    pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'main' AND c.relkind = 'r'
+             ORDER BY pg_total_relation_size(c.oid) DESC;"
 echo "==> Done"
